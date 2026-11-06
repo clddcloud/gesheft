@@ -2,11 +2,37 @@
 // Env-змінні (Vercel → Settings → Environment Variables):
 //   WFP_MERCHANT_ACCOUNT  - merchantAccount з кабінету WayForPay
 //   WFP_SECRET_KEY        - SecretKey з кабінету WayForPay
-//   TICKET_PRICE          - ціна квитка (за замовчуванням 250)
+// Ціни квитків задаються розкладом PRICE_SCHEDULE нижче (змінювати тільки там).
 const crypto = require('crypto');
 
 const PIXEL_ID = '2169090437150978'; // Pixel Gesheft winter 2026
-const TICKET_PRICE = Number(process.env.TICKET_PRICE) || 250; // ціна в одному місці
+
+// Розклад цін (дата й час за київським часом, формат YYYY-MM-DD HH:mm:ss).
+// Береться перший рядок, де момент замовлення >= from. Рядки йдуть від новішої дати до старішої.
+const PRICE_SCHEDULE = [
+  { from: '2026-12-12 10:00:00', price: 300 },
+  { from: '0000-00-00 00:00:00', price: 250 },
+];
+
+function kyivDate(tsSeconds) {
+  // повертає 'YYYY-MM-DD HH:mm:ss' за київським часом
+  return new Date(tsSeconds * 1000).toLocaleString('sv-SE', { timeZone: 'Europe/Kyiv' });
+}
+
+function priceForDate(dateStr) {
+  return PRICE_SCHEDULE.find((r) => dateStr >= r.from).price;
+}
+
+// Кількість квитків: спочатку за ціною на дату замовлення,
+// якщо сума не ділиться націло - пробуємо інші ціни з розкладу.
+function countTickets(amount, tsSeconds) {
+  const main = priceForDate(kyivDate(tsSeconds));
+  if (amount > 0 && amount % main === 0) return amount / main;
+  for (const r of PRICE_SCHEDULE) {
+    if (amount > 0 && amount % r.price === 0) return amount / r.price;
+  }
+  return Math.max(1, Math.round(amount / main));
+}
 
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
@@ -46,8 +72,8 @@ async function checkStatus(orderReference) {
   return r.json();
 }
 
-function page({ approved, orderReference, amount, currency }) {
-  const numItems = Math.max(1, Math.round(amount / TICKET_PRICE));
+function page({ approved, orderReference, amount, currency, ts }) {
+  const numItems = countTickets(amount, ts);
   const pixel = `
 <script>
 !function(f,b,e,v,n,t,s){if(f.fbq)return;n=f.fbq=function(){n.callMethod?n.callMethod.apply(n,arguments):n.queue.push(arguments)};if(!f._fbq)f._fbq=n;n.push=n;n.loaded=!0;n.version='2.0';n.queue=[];t=b.createElement(e);t.async=!0;t.src=v;s=b.getElementsByTagName(e)[0];s.parentNode.insertBefore(t,s)}(window,document,'script','https://connect.facebook.net/en_US/fbevents.js');
@@ -92,6 +118,7 @@ module.exports = async (req, res) => {
   let approved = false;
   let amount = Number(body.amount) || 0;
   let currency = body.currency;
+  let ts = Number(body.createdDate) || Math.floor(Date.now() / 1000);
 
   if (orderReference) {
     try {
@@ -101,6 +128,7 @@ module.exports = async (req, res) => {
         approved = checked.transactionStatus === 'Approved';
         amount = Number(checked.amount) || amount;
         currency = checked.currency || currency;
+        ts = Number(checked.createdDate) || ts;
       } else {
         // Без SecretKey - fallback на дані з POST (менш надійно)
         approved = body.transactionStatus === 'Approved';
@@ -112,5 +140,5 @@ module.exports = async (req, res) => {
   }
 
   // 200 завжди, щоб людина не бачила помилку
-  res.status(200).send(page({ approved, orderReference, amount, currency }));
+  res.status(200).send(page({ approved, orderReference, amount, currency, ts }));
 };
