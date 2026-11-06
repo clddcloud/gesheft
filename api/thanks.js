@@ -36,12 +36,26 @@ function countTickets(amount, tsSeconds) {
 
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
+// Читає тіло запиту в будь-якому вигляді (об'єкт, рядок, Buffer, сирий потік)
+async function readRaw(req) {
+  if (req.body !== undefined && req.body !== null) return req.body;
+  const chunks = [];
+  for await (const c of req) chunks.push(typeof c === 'string' ? Buffer.from(c) : c);
+  return Buffer.concat(chunks);
+}
+
+function fromString(str) {
+  str = str.trim();
+  if (!str) return {};
+  try { return JSON.parse(str); } catch {}
+  return Object.fromEntries(new URLSearchParams(str));
+}
+
 // WayForPay може прислати form-urlencoded або JSON (інколи JSON лежить у єдиному ключі)
-function parseBody(req) {
-  let b = req.body;
-  if (typeof b === 'string') {
-    try { b = JSON.parse(b); } catch { b = Object.fromEntries(new URLSearchParams(b)); }
-  }
+async function parseBody(req) {
+  let b = await readRaw(req);
+  if (Buffer.isBuffer(b)) b = b.toString('utf8');
+  if (typeof b === 'string') b = fromString(b);
   if (!b || typeof b !== 'object') return {};
   const keys = Object.keys(b);
   if (keys.length === 1 && keys[0].trim().startsWith('{')) {
@@ -130,7 +144,10 @@ module.exports = async (req, res) => {
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   res.setHeader('Cache-Control', 'no-store');
 
-  const body = req.method === 'POST' ? parseBody(req) : {};
+  let body = {};
+  try { body = req.method === 'POST' ? await parseBody(req) : {}; } catch (e) { console.error('PARSE error', e); }
+  if (!body.orderReference && req.query && req.query.orderReference) body = { ...req.query, ...body };
+  const debug = { method: req.method, contentType: req.headers['content-type'], bodyKeys: Object.keys(body), hasSecret: !!process.env.WFP_SECRET_KEY, hasMerchant: !!(body.merchantAccount || process.env.WFP_MERCHANT_ACCOUNT), postStatus: body.transactionStatus, check: null, error: null };
   {
     const { merchantSignature, cardPan, ...safe } = body;
     console.log('REQUEST', req.method, req.headers['content-type'], JSON.stringify(safe));
@@ -144,6 +161,7 @@ module.exports = async (req, res) => {
   if (orderReference) {
     try {
       const checked = await checkStatusWithRetry(orderReference, body.merchantAccount);
+      debug.check = checked;
       if (checked) {
         // Є SecretKey: довіряємо тільки відповіді WayForPay
         approved = checked.transactionStatus === 'Approved';
@@ -156,10 +174,15 @@ module.exports = async (req, res) => {
       }
     } catch (e) {
       console.error('CHECK_STATUS error', e);
+      debug.error = String(e && e.message || e);
       approved = false;
     }
   }
 
   // 200 завжди, щоб людина не бачила помилку
-  res.status(200).send(page({ approved, orderReference, amount, currency, ts }));
+  let html = page({ approved, orderReference, amount, currency, ts });
+  if (process.env.WFP_DEBUG === '1') {
+    html = html.replace('</body>', '<pre style="position:fixed;left:0;right:0;bottom:0;max-height:45vh;overflow:auto;background:#111;color:#0f0;font-size:12px;margin:0;padding:10px;white-space:pre-wrap">DEBUG\n' + esc(JSON.stringify(debug, null, 1)) + '</pre></body>');
+  }
+  res.status(200).send(html);
 };
