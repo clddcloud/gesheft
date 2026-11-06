@@ -50,9 +50,10 @@ function parseBody(req) {
   return b;
 }
 
-async function checkStatus(orderReference) {
-  const merchantAccount = process.env.WFP_MERCHANT_ACCOUNT;
-  const secret = process.env.WFP_SECRET_KEY;
+async function checkStatus(orderReference, merchantFromPost) {
+  const secret = (process.env.WFP_SECRET_KEY || '').trim();
+  // merchantAccount беремо з POST від WayForPay (він точно правильний), інакше з env
+  const merchantAccount = (merchantFromPost || process.env.WFP_MERCHANT_ACCOUNT || '').trim();
   if (!merchantAccount || !secret) return null;
   const merchantSignature = crypto
     .createHmac('md5', secret)
@@ -70,6 +71,22 @@ async function checkStatus(orderReference) {
     }),
   });
   return r.json();
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Інколи статус ще "InProcessing"/"Pending" - перепитуємо до 3 разів
+async function checkStatusWithRetry(orderReference, merchantFromPost) {
+  let last = null;
+  for (let i = 0; i < 3; i++) {
+    last = await checkStatus(orderReference, merchantFromPost);
+    console.log('CHECK_STATUS attempt', i + 1, JSON.stringify(last));
+    if (!last) return null;
+    const st = last.transactionStatus;
+    if (st && st !== 'InProcessing' && st !== 'Pending' && st !== 'WaitingAuthComplete') break;
+    await sleep(1500);
+  }
+  return last;
 }
 
 function page({ approved, orderReference, amount, currency, ts }) {
@@ -114,6 +131,10 @@ module.exports = async (req, res) => {
   res.setHeader('Cache-Control', 'no-store');
 
   const body = req.method === 'POST' ? parseBody(req) : {};
+  {
+    const { merchantSignature, cardPan, ...safe } = body;
+    console.log('REQUEST', req.method, req.headers['content-type'], JSON.stringify(safe));
+  }
   const orderReference = body.orderReference;
   let approved = false;
   let amount = Number(body.amount) || 0;
@@ -122,7 +143,7 @@ module.exports = async (req, res) => {
 
   if (orderReference) {
     try {
-      const checked = await checkStatus(orderReference);
+      const checked = await checkStatusWithRetry(orderReference, body.merchantAccount);
       if (checked) {
         // Є SecretKey: довіряємо тільки відповіді WayForPay
         approved = checked.transactionStatus === 'Approved';
